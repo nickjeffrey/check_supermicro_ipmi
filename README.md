@@ -1,9 +1,12 @@
 # check_supermicro_ipmi
  nagios check to query IPMI service processor on SuperMicro motherboard to read temperature sensors, fan speeds, etc.
 
+
 ## Requirements
 perl, snmpwalk, snmpget
 
+
+## Configuration
 You will need a section in the services.cfg
 file on the nagios server that looks similar to the following.
 ```
