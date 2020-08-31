@@ -30,3 +30,10 @@ You will also need a command definition similar to the following in commands.cfg
               }
 ```
 
+
+
+## Output
+Output will look similar to the following:
+```
+SuperMicro IPMI OK - System temperature:37C  CPU temperature:53C  DIMM-A1 temperature:37C DIMM-B1 temperature:37C PCH temperature:49C Fan1:5200rpm FanB:5300rpm | system_temperature=37;45;40;; cpu_temperature=53;65;60;;
+```
