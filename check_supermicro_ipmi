@@ -1,0 +1,744 @@
+#!/usr/bin/perl
+
+#OUTSTANDING TASKS
+#-----------------
+#  Add more performance data details to the output  (ie fan speeds)
+
+
+# CHANGE LOG
+# ----------
+# 2018/07/06	njeffrey	Script created to monitor IPMI service processor on SuperMicro motherboard
+# 2018/07/07	njeffrey	Add nagios performance data to output (for graphing)
+# 2019/12/20	njeffrey	Add Fan3 and Fan4 to output
+# 2020/08/30	njeffrey	Different models of IPMI controllers use inconsistent numbering schemes for OID values
+
+
+# nagios shell script to query IPMI service processor on SuperMicro motherboard to read temperature sensors, fan speeds, etc.
+
+
+# NOTES
+# -----
+#
+#  This script should return one (and only one) line of ouput.  Multiple
+#  lines of output are silently ignored by nagios.
+#
+#  The line of output will become the body of the alert message sent by nagios
+#
+#
+#  This script queries a remote host via SNMP
+#
+#  You will need a section in the services.cfg
+#  file on the nagios server that looks similar to the following.
+#      # Define a service to check the SuperMicro IPMI
+#      # Parameters are SNMP community name
+#      define service {
+#              use                             generic-service
+#              hostgroup_name                  all_supermicro_ipmi
+#              service_description             SuperMicro IPMI
+#              check_command                   check_supermicro_ipmi!public
+#              }
+#
+#
+#  You will also need a command definition similar to the following in commands.cfg on the nagios server
+#      # 'check_supermicro_ipmi' command definition
+#      # parameters are -H hostname -C snmp_community
+#      define command{
+#              command_name    check_supermicro_ipmi
+#              command_line    $USER1$/check_supermicro_ipmi -H $HOSTADDRESS$ -C $ARG1$
+#              }
+#
+#
+
+
+# Different SuperMicro IPMI controllers may use slightly different OID values.  
+# NOTE: The examples below may differ depending on the model of the IPMI controller
+#
+#.1.3.6.1.4.1.21317.1.3.1.2.11 = INTEGER: 37
+#.1.3.6.1.4.1.21317.1.3.1.13.11 = STRING: "System Temp     "
+#
+#.1.3.6.1.4.1.21317.1.3.1.2.12 = INTEGER: 34
+#.1.3.6.1.4.1.21317.1.3.1.13.12 = STRING: "Peripheral Temp     "
+#
+#.1.3.6.1.4.1.21317.1.3.1.2.10 = INTEGER: 49
+#.1.3.6.1.4.1.21317.1.3.1.13.10 = STRING: "PCH Temp     "
+#
+#.1.3.6.1.4.1.21317.1.3.1.2.1 = INTEGER: 53
+#.1.3.6.1.4.1.21317.1.3.1.13.1 = STRING: "CPU Temp   "
+#
+#.1.3.6.1.4.1.21317.1.3.1.2.176 = INTEGER: 53                 <------ degrees celsius
+#.1.3.6.1.4.1.21317.1.3.1.13.176 = STRING: "DIMMA1 Temp   "
+#
+#.1.3.6.1.4.1.21317.1.3.1.2.180 = INTEGER: 53
+#.1.3.6.1.4.1.21317.1.3.1.13.180 = STRING: "DIMMB1 Temp   "
+#
+#.1.3.6.1.4.1.21317.1.3.1.2.65 = INTEGER: 52                 <---- this value is in hundreds of RPMs
+#.1.3.6.1.4.1.21317.1.3.1.13.65 = STRING: "FAN1   "
+#
+#.1.3.6.1.4.1.21317.1.3.1.2.66 = INTEGER: 52                 <---- this value is in hundreds of RPMs
+#.1.3.6.1.4.1.21317.1.3.1.13.66 = STRING: "FAN2   "
+#
+#.1.3.6.1.4.1.21317.1.3.1.2.67 = INTEGER: 52                 <---- this value is in hundreds of RPMs
+#.1.3.6.1.4.1.21317.1.3.1.13.67 = STRING: "FAN3   "
+#
+#.1.3.6.1.4.1.21317.1.3.1.2.68 = INTEGER: 52                 <---- this value is in hundreds of RPMs
+#.1.3.6.1.4.1.21317.1.3.1.13.68 = STRING: "FAN4   "
+#
+#.1.3.6.1.4.1.21317.1.3.1.2.69 = INTEGER: 52                 <---- this value is in hundreds of RPMs
+#.1.3.6.1.4.1.21317.1.3.1.13.69 = STRING: "FANA   "
+#
+#.1.3.6.1.4.1.21317.1.3.1.2.70 = INTEGER: 52                 <---- this value is in hundreds of RPMs
+#.1.3.6.1.4.1.21317.1.3.1.13.70 = STRING: "FANB   "
+#
+#.1.3.6.1.4.1.21317.1.3.1.2.170 = INTEGER: 0                 <---- 0=ok, 
+#.1.3.6.1.4.1.21317.1.3.1.13.170 = STRING: "Chassis Intru"
+
+
+
+
+
+use strict;				#enforce good coding practices
+use Getopt::Long;                       #allow --long-switches to be used as parameters.  Install with: perl -MCPAN -e 'install Getopt::Long'
+
+
+
+# declare variables
+my ($OK,$WARN,$CRITICAL,$UNKNOWN);
+my ($CHECK_NAME,$cmd,$snmpwalk,$snmpget);
+my ($host,$temp_oid,$base_oid,$oid_label,$oid,$key,%ipmi,$community);
+my ($cpu_temp_crit,$cpu_temp_warn,$system_temp_crit,$system_temp_warn);
+my ($opt_h,$opt_v,$opt_w,$opt_c,$opt_C,$opt_H);
+my ($verbose,$output_details,$perf_data);
+$cmd = "";                                              #initialize variable
+$CHECK_NAME                 = "SuperMicro IPMI";	#name of nagios check
+$verbose                    = "no";                    	#yes/no variable to increase output for debugging
+$cpu_temp_warn              = 60;			#warn if CPU temperature reaches this value in degrees celsius
+$cpu_temp_crit              = 65;			#critical if CPU temperature reaches this value in degrees celsius
+$system_temp_warn           = 40;			#warn if motherboard temperature sensor reaches this value in degres celsius
+$system_temp_crit           = 45;			#critical if motherboard temperature sensor reaches this value in degres celsius
+$community                  = "public";  		#default SNMP community name
+$output_details             = "";			#initialize variable to hold details of script output
+$snmpwalk                   = "/usr/bin/snmpwalk";	#location of binary
+$snmpget                    = "/usr/bin/snmpget";	#location of binary
+#
+# Nagios return codes
+#
+$OK=            0;
+$WARN=          1;
+$CRITICAL=      2;
+$UNKNOWN=       3;
+
+
+
+
+sub get_options {
+   #
+   # this gets the command line parameters provided by the users
+   #
+   print "running get_options subroutine \n" if ($verbose eq "yes");
+   #
+   Getopt::Long::Configure('bundling');
+   GetOptions(
+      "h"   => \$opt_h, "help"        => \$opt_h,
+      "v"   => \$opt_v, "verbose"     => \$opt_v,
+      "C=s" => \$opt_C, "community=s" => \$opt_C, "comm=s" => \$opt_C,
+      "H=s" => \$opt_H, "hostname=s"  => \$opt_H, "host=s" => \$opt_H,
+   );
+   #
+   #
+   #
+   # If the user supplied -h or --help, generate the help messages
+   #
+   if( defined( $opt_h ) ) {
+      print "Nagios plugin for determining filesystem usage. \n";
+      print "Examples: \n";
+      print "   $0 --host=myfiler --community=public \n";
+      print "   $0     -H myfiler          -C public \n";
+      print "\n\n";
+      exit $UNKNOWN;
+   }
+   #
+   # If the user supplied -v or --verbose, increase verbosity for debugging
+   if( defined( $opt_v ) ) {
+      $verbose = "yes";
+   } 
+   #
+   #
+   # If the user did not supply a --community SNMP community string, use "public"
+   #
+   if( defined( $opt_C ) ) {
+      $community = $opt_C;
+   } else {
+      $community = "public";
+   }
+   #
+   # If the user did not supply a --host=??? , generate a warning
+   #
+   if( defined( $opt_H ) ) {
+      $host = $opt_H;
+   } else {
+      print "$CHECK_NAME UNKNOWN - a remote host to check was not provided. Use this syntax: $0 -H hostname -C snmp_community\n";
+      exit $CRITICAL;                                           #exit script
+   }
+   #
+   print "host=$host community=$community \n" if ($verbose eq "yes");
+}                       #end of subroutine
+
+
+
+
+
+sub sanity_checks {
+   #
+   #
+   print "running sanity_checks subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   if ( ! -f "$snmpwalk" ) {
+      print "ERROR: Cannot find $snmpwalk \n";
+      exit;
+   }
+   if ( ! -x "$snmpwalk" ) {
+      print "ERROR: $snmpwalk is not executable by the current user\n";
+      exit;
+   }
+   if ( ! -f "$snmpget" ) {
+      print "ERROR: Cannot find $snmpget \n";
+      exit;
+   }
+   if ( ! -x "$snmpget" ) {
+      print "ERROR: $snmpget is not executable by the current user\n";
+      exit;
+   }
+}                                                       #end of subroutine
+
+
+
+
+
+sub get_system_temperature {
+   #
+   # query the SNMP counters on the IPMI controller to read temperature sensors, fan speeds, etc.
+   #
+   print "running get_system_temperature subroutine \n" if ($verbose eq "yes");
+   #
+   # There are multiple temperature sensors on the motherboard, so check them all.
+   # Unfortunately, the OID values are not consistent between IPMI controllers on different SuperMicro server models.
+   # To ensure we are querying the correct OID, we have to jump through a few hoops:
+   #   .1.3.6.1.4.1.21317.1.3.1.2.???    <---- value we want to read
+   #   .1.3.6.1.4.1.21317.1.3.1.13.???   <---- text label description of what we are reading
+   # 
+   # In other words, to find the correct OID for "CPU Temp", find the correct label in .1.3.6.1.4.1.21317.1.3.1.13.???,
+   # then find the value in same place in .1.3.6.1.4.1.21317.1.3.1.2.???
+   # Fortunately, the following text-based labels seem to be identical across different models, if even if the OID's are not consistent.
+   #   System Temp        <--- all the temperatures are measured in degrees Celsius
+   #   Peripheral Temp
+   #   PCH Temp           <--- Platform Controller Host
+   #   CPU Temp
+   #   DIMMA1 Temp
+   #   DIMMB1 Temp
+   #   FAN1               <--- fan values are measured in RPM, sometimes integers, sometimes with 2 decimal places
+   #   FAN2
+   #   FAN3
+   #   FAN4
+   #   FANA
+   #   FANB
+   #   
+   #
+   #
+   my @array = ("System Temp","Peripheral Temp","PCH Temp","CPU Temp","DIMMA1 Temp","DIMMB1 Temp");
+   #
+   #
+   $base_oid = ".1.3.6.1.4.1.21317.1.3.1";                             #sub-trees from this OID are .2=value .13=label
+   $cmd = "$snmpwalk -Ona -v 1 -c $community $host ${base_oid}.13";               #use -Ona to convert the Hex-String output to human readable ASCII
+   print "   running command to find label for $oid_label: $cmd \n" if ($verbose eq "yes");
+   #
+   open(IN,"$cmd |");                                                   #get the index numbers of the LUNs
+   while (<IN>) {                                                       #read a line from the command output
+      #
+      # looking for output similar to:  .1.3.6.1.4.1.21317.1.3.1.13.??? = STRING: "System Temp....."
+      #
+      foreach $oid_label (@array) {
+         s/\"//g;                                                          #get rid of quotation marks
+         if ( /${base_oid}.13.([0-9]+) = STRING: $oid_label/ ) { 		#find the line with the text label we are looking for
+            print "$oid_label  \n" if ($verbose eq "yes");
+            print "   label OID is  ${base_oid}.13.$1 \n" if ($verbose eq "yes");
+            print "   value OID is  ${base_oid}.2.$1  \n" if ($verbose eq "yes");
+            $temp_oid = "${base_oid}.2.$1";					#save in temporary variable because $1 will get lost
+            if ($oid_label =~ /System Temp/) {		#assign value to hash
+               $ipmi{systemtemp_oid}     = "$temp_oid";
+               print "   Found label for System Temp.  Value is at $temp_oid \n" if ($verbose eq "yes");
+            }
+            if ($oid_label =~ /Peripheral Temp/) {		#assign value to hash
+               $ipmi{peripheraltemp_oid} = "$temp_oid";
+               print "   Found label for Peripheral Temp.  Value is at $temp_oid \n" if ($verbose eq "yes");
+            }
+            if ($oid_label =~ /PCH Temp/) {			#assign value to hash
+               $ipmi{pchtemp_oid}        = "$temp_oid"; 
+               print "   Found label for PCH Temp.  Value is at $temp_oid \n" if ($verbose eq "yes");
+            }
+            if ($oid_label =~ /CPU Temp/) {			#assign value to hash
+               $ipmi{cputemp_oid}        = "$temp_oid"; 
+               print "   Found label for CPU Temp.  Value is at $temp_oid \n" if ($verbose eq "yes");
+            }
+            if ($oid_label =~ /DIMMA1 Temp/) {		#assign value to hash
+               $ipmi{dimma1temp_oid}     = "$temp_oid"; 
+               print "   Found label for DIMMA1 Temp.  Value is at $temp_oid \n" if ($verbose eq "yes");
+            }
+            if ($oid_label =~ /DIMMB1 Temp/) {		#assign value to hash
+               $ipmi{dimmb1temp_oid}     = "$temp_oid"; 
+               print "   Found label for DIMMB1 Temp.  Value is at $temp_oid \n" if ($verbose eq "yes");
+            }
+         } 								#end of if block
+      }                                                                 #end of foreach loop
+   }                                                                    #end of while loop
+   close IN;								#close filehandle
+   #
+   #
+   # At this point, we have done a single SNMPWALK of the .1.3.6.1.4.1.21317.1.3.1.13.??? MIB tree to find the text labels.
+   # Now instead of the slow SNMPWALK commands, we can do SNMPGET of specific OID for each value we want.
+   # 
+   #
+   # Look for System Temp
+   #
+   $ipmi{systemtemp} = "unknown";					#initialize variable
+   if ($ipmi{systemtemp_oid}) {						#confirm OID was found in the earlier SNMPWALK section
+      $cmd = "$snmpwalk -On -v 1 -c $community $host $ipmi{systemtemp_oid}";        #use -On to output the results in integer
+      print "   running command to find value for systemtemp: $cmd \n" if ($verbose eq "yes");
+      open(IN,"$cmd |");                                                #get the index numbers of the LUNs
+      while (<IN>) {                                                    #read a line from the command output
+         #
+         # looking for output similar to:  .1.3.6.1.4.1.21317.1.3.1.2.??? = INTEGER: 37
+         # or possibly in STRING format:   .1.3.6.1.4.1.21317.1.3.1.2.??? = STRING: "37.000"
+         #
+         s/\"//g;                                                       #get rid of quotation marks
+         if ( (/$ipmi{systemtemp_oid} = INTEGER: ([0-9]+)/) || (/$ipmi{systemtemp_oid} = STRING: ([0-9\.]+)/) ) {  #find the line with the text label we are looking for
+            $ipmi{systemtemp} = $1;					#assign value to hash
+            $ipmi{systemtemp} = sprintf("%.0f",$ipmi{systemtemp});            #truncate to zero decimal places
+            print "   System temperature: $ipmi{systemtemp} C\n" if ($verbose eq "yes");
+         }
+      }                                                                 #end of while loop
+      close IN;								#close filehandle
+   } 									#end of if block
+   # 
+   #
+   # Look for Peripheral Temp
+   #
+   $ipmi{peripheraltemp} = "unknown";					#initialize variable
+   if ($ipmi{peripheraltemp_oid}) {					#confirm OID was found in the earlier SNMPWALK section
+      $cmd = "$snmpwalk -On -v 1 -c $community $host $ipmi{peripheraltemp_oid}";        #use -On to output the results in integer
+      print "   running command to find value for peripheraltemp: $cmd \n" if ($verbose eq "yes");
+      open(IN,"$cmd |");                                                #get the index numbers of the LUNs
+      while (<IN>) {                                                    #read a line from the command output
+         #
+         # looking for output similar to:  .1.3.6.1.4.1.21317.1.3.1.2.??? = INTEGER: 37
+         # or possibly in STRING format:   .1.3.6.1.4.1.21317.1.3.1.2.??? = STRING: "37.000"
+         #
+         s/\"//g;                                                       #get rid of quotation marks
+         if ( (/$ipmi{peripheraltemp_oid} = INTEGER: ([0-9]+)/) || (/$ipmi{peripheraltemp_oid} = STRING: ([0-9\.]+)/) ) {  #find the line with the text label we are looking for
+            $ipmi{peripheraltemp} = $1;					#assign value to hash
+            $ipmi{peripheraltemp} = sprintf("%.0f",$ipmi{peripheraltemp});            #truncate to zero decimal places
+            print "   Peripheral temperature: $ipmi{peripheraltemp} C\n" if ($verbose eq "yes");
+         }
+      }                                                                 #end of while loop
+      close IN;								#close filehandle
+   } 									#end of if block
+   # 
+   #
+   # Look for PCH Temp
+   #
+   $ipmi{pchtemp} = "unknown";					#initialize variable
+   if ($ipmi{pchtemp_oid}) {					#confirm OID was found in the earlier SNMPWALK section
+      $cmd = "$snmpwalk -On -v 1 -c $community $host $ipmi{pchtemp_oid}";        #use -On to output the results in integer
+      print "   running command to find value for pchtemp: $cmd \n" if ($verbose eq "yes");
+      open(IN,"$cmd |");                                                #get the index numbers of the LUNs
+      while (<IN>) {                                                    #read a line from the command output
+         #
+         # looking for output similar to:  .1.3.6.1.4.1.21317.1.3.1.2.??? = INTEGER: 37
+         # or possibly in STRING format:   .1.3.6.1.4.1.21317.1.3.1.2.??? = STRING: "37.000"
+         #
+         s/\"//g;                                                       #get rid of quotation marks
+         if ( (/$ipmi{pchtemp_oid} = INTEGER: ([0-9]+)/) || (/$ipmi{pchtemp_oid} = STRING: ([0-9\.]+)/) ) {  #find the line with the text label we are looking for
+            $ipmi{pchtemp} = $1;					#assign value to hash
+            $ipmi{pchtemp} = sprintf("%.0f",$ipmi{pchtemp});            #truncate to zero decimal places
+            print "   PCH (Platform Controller Host) temperature: $ipmi{pchtemp} C\n" if ($verbose eq "yes");
+         }
+      }                                                                 #end of while loop
+      close IN;								#close filehandle
+   } 									#end of if block
+   # 
+   #
+   # Look for CPU Temp
+   #
+   $ipmi{cputemp} = "unknown";					#initialize variable
+   if ($ipmi{cputemp_oid}) {					#confirm OID was found in the earlier SNMPWALK section
+      $cmd = "$snmpwalk -On -v 1 -c $community $host $ipmi{cputemp_oid}";        #use -On to output the results in integer
+      print "   running command to find value for cputemp: $cmd \n" if ($verbose eq "yes");
+      open(IN,"$cmd |");                                                #get the index numbers of the LUNs
+      while (<IN>) {                                                    #read a line from the command output
+         #
+         # looking for output similar to:  .1.3.6.1.4.1.21317.1.3.1.2.??? = INTEGER: 37
+         # or possibly in STRING format:   .1.3.6.1.4.1.21317.1.3.1.2.??? = STRING: "37.000"
+         #
+         s/\"//g;                                                       #get rid of quotation marks
+         if ( (/$ipmi{cputemp_oid} = INTEGER: ([0-9]+)/) || (/$ipmi{cputemp_oid} = STRING: ([0-9\.]+)/) ) {  #find the line with the text label we are looking for
+            $ipmi{cputemp} = $1;					#assign value to hash
+            $ipmi{cputemp} = sprintf("%.0f",$ipmi{cputemp});            #truncate to zero decimal places
+            print "   CPU temperature: $ipmi{cputemp} C\n" if ($verbose eq "yes");
+         }
+      }                                                                 #end of while loop
+      close IN;								#close filehandle
+   } 									#end of if block
+   # 
+   #
+   # Look for DIMMA1 Temp
+   #
+   $ipmi{dimma1temp} = "unknown";					#initialize variable
+   if ($ipmi{dimma1temp_oid}) {					#confirm OID was found in the earlier SNMPWALK section
+      $cmd = "$snmpwalk -On -v 1 -c $community $host $ipmi{dimma1temp_oid}";        #use -On to output the results in integer
+      print "   running command to find value for dimma1temp: $cmd \n" if ($verbose eq "yes");
+      open(IN,"$cmd |");                                                #get the index numbers of the LUNs
+      while (<IN>) {                                                    #read a line from the command output
+         #
+         # looking for output similar to:  .1.3.6.1.4.1.21317.1.3.1.2.??? = INTEGER: 37
+         # or possibly in STRING format:   .1.3.6.1.4.1.21317.1.3.1.2.??? = STRING: "37.000"
+         #
+         s/\"//g;                                                       #get rid of quotation marks
+         if ( (/$ipmi{dimma1temp_oid} = INTEGER: ([0-9]+)/) || (/$ipmi{dimma1temp_oid} = STRING: ([0-9\.]+)/) ) {  #find the line with the text label we are looking for
+            $ipmi{dimma1temp} = $1;					#assign value to hash
+            $ipmi{dimma1temp} = sprintf("%.0f",$ipmi{dimma1temp});            #truncate to zero decimal places
+            print "   DIMMA1 temperature: $ipmi{dimma1temp} C\n" if ($verbose eq "yes");
+         }
+      }                                                                 #end of while loop
+      close IN;								#close filehandle
+   } 									#end of if block
+   # 
+   #
+   # Look for DIMMB1 Temp
+   #
+   $ipmi{dimmb1temp} = "unknown";					#initialize variable
+   if ($ipmi{dimmb1temp_oid}) {					#confirm OID was found in the earlier SNMPWALK section
+      $cmd = "$snmpwalk -On -v 1 -c $community $host $ipmi{dimmb1temp_oid}";        #use -On to output the results in integer
+      print "   running command to find value for dimmb1temp: $cmd \n" if ($verbose eq "yes");
+      open(IN,"$cmd |");                                                #get the index numbers of the LUNs
+      while (<IN>) {                                                    #read a line from the command output
+         #
+         # looking for output similar to:  .1.3.6.1.4.1.21317.1.3.1.2.??? = INTEGER: 37
+         # or possibly in STRING format:   .1.3.6.1.4.1.21317.1.3.1.2.??? = STRING: "37.000"
+         #
+         s/\"//g;                                                       #get rid of quotation marks
+         if ( (/$ipmi{dimmb1temp_oid} = INTEGER: ([0-9]+)/) || (/$ipmi{dimmb1temp_oid} = STRING: ([0-9\.]+)/) ) {  #find the line with the text label we are looking for
+            $ipmi{dimmb1temp} = $1;					#assign value to hash
+            $ipmi{dimmb1temp} = sprintf("%.0f",$ipmi{dimmb1temp});            #truncate to zero decimal places
+            print "   DIMMB1 temperature: $ipmi{dimma1temp} C\n" if ($verbose eq "yes");
+         }
+      }                                                                 #end of while loop
+      close IN;								#close filehandle
+   } 									#end of if block
+}									#end of subroutine 
+
+
+
+sub get_fan_speeds {
+   #
+   # query the SNMP counters on the IPMI controller to read temperature sensors, fan speeds, etc.
+   #
+   print "running get_fan_speeds subroutine \n" if ($verbose eq "yes");
+   #
+   # There are multiple temperature sensors on the motherboard, so check them all.
+   # Unfortunately, the OID values are not consistent between IPMI controllers on different SuperMicro server models.
+   # To ensure we are querying the correct OID, we have to jump through a few hoops:
+   #   .1.3.6.1.4.1.21317.1.3.1.2.???    <---- value we want to read
+   #   .1.3.6.1.4.1.21317.1.3.1.13.???   <---- text label description of what we are reading
+   # 
+   # In other words, to find the correct OID for "CPU Temp", find the correct label in .1.3.6.1.4.1.21317.1.3.1.13.???,
+   # then find the value in same place in .1.3.6.1.4.1.21317.1.3.1.2.???
+   # Fortunately, the following text-based labels seem to be identical across different models, if even if the OID's are not consistent.
+   #   System Temp        <--- all the temperatures are measured in degrees Celsius
+   #   Peripheral Temp
+   #   PCH Temp           <--- Platform Controller Host
+   #   CPU Temp
+   #   DIMMA1 Temp
+   #   DIMMB1 Temp
+   #   FAN1               <--- fan values are measured in RPM, sometimes integers, sometimes with 2 decimal places
+   #   FAN2
+   #   FAN3
+   #   FAN4
+   #   FANA
+   #   FANB
+   #   
+   #
+   #
+   my @array = ("FAN1","FAN2","FAN3","FAN4","FANA","FANB");
+   #
+   #
+   $base_oid = ".1.3.6.1.4.1.21317.1.3.1";                             #sub-trees from this OID are .2=value .13=label
+   $cmd = "$snmpwalk -Ona -v 1 -c $community $host ${base_oid}.13";               #use -Ona to convert the Hex-String output to human readable ASCII
+   print "   running command to find label for $oid_label: $cmd \n" if ($verbose eq "yes");
+   #
+   open(IN,"$cmd |");                                                   #get the index numbers of the LUNs
+   while (<IN>) {                                                       #read a line from the command output
+      #
+      # looking for output similar to:  .1.3.6.1.4.1.21317.1.3.1.13.??? = STRING: "System Temp....."
+      #
+      foreach $oid_label (@array) {
+         s/\"//g;                                                       #get rid of quotation marks
+         if ( /${base_oid}.13.([0-9]+) = STRING: $oid_label/ ) { 	#find the line with the text label we are looking for
+            print "$oid_label  \n" if ($verbose eq "yes");
+            print "   label OID is  ${base_oid}.13.$1 \n" if ($verbose eq "yes");
+            print "   value OID is  ${base_oid}.2.$1  \n" if ($verbose eq "yes");
+            $temp_oid = "${base_oid}.2.$1";				#save in temporary variable because $1 will get lost
+            if ($oid_label =~ /FAN1/) {					#assign value to hash
+               $ipmi{fan1speed_oid}     = "$temp_oid";
+               print "   Found label for FAN1 speed.  Value is at $temp_oid \n" if ($verbose eq "yes");
+            }
+            if ($oid_label =~ /FAN2/) {					#assign value to hash
+               $ipmi{fan2speed_oid}     = "$temp_oid";
+               print "   Found label for FAN2 speed.  Value is at $temp_oid \n" if ($verbose eq "yes");
+            }
+            if ($oid_label =~ /FAN3/) {					#assign value to hash
+               $ipmi{fan3speed_oid}     = "$temp_oid";
+               print "   Found label for FAN3 speed.  Value is at $temp_oid \n" if ($verbose eq "yes");
+            }
+            if ($oid_label =~ /FAN4/) {					#assign value to hash
+               $ipmi{fan4speed_oid}     = "$temp_oid";
+               print "   Found label for FAN4 speed.  Value is at $temp_oid \n" if ($verbose eq "yes");
+            }
+            if ($oid_label =~ /FANA/) {					#assign value to hash
+               $ipmi{fanaspeed_oid}     = "$temp_oid";
+               print "   Found label for FANA speed.  Value is at $temp_oid \n" if ($verbose eq "yes");
+            }
+            if ($oid_label =~ /FANB/) {					#assign value to hash
+               $ipmi{fanbspeed_oid}     = "$temp_oid";
+               print "   Found label for FANB speed.  Value is at $temp_oid \n" if ($verbose eq "yes");
+            }
+         } 								#end of if block
+      }                                                                 #end of foreach loop
+   }                                                                    #end of while loop
+   close IN;								#close filehandle
+   #
+   #
+   # At this point, we have done a single SNMPWALK of the .1.3.6.1.4.1.21317.1.3.1.13.??? MIB tree to find the text labels.
+   # Now instead of the slow SNMPWALK commands, we can do SNMPGET of specific OID for each value we want.
+   # 
+   #
+   # Look for FAN1
+   #
+   $ipmi{fan1speed} = 0;					#initialize variable
+   if ($ipmi{fan1speed_oid}) {						#confirm OID was found in the earlier SNMPWALK section
+      $cmd = "$snmpwalk -On -v 1 -c $community $host $ipmi{fan1speed_oid}";        #use -On to output the results in integer
+      print "   running command to find value for fan1speed: $cmd \n" if ($verbose eq "yes");
+      open(IN,"$cmd |");                                                #get the index numbers of the LUNs
+      while (<IN>) {                                                    #read a line from the command output
+         #
+         # looking for output similar to:  .1.3.6.1.4.1.21317.1.3.1.2.??? = INTEGER: 68          <------ integer values need to be multiplied by 100
+         # or possibly in STRING format:   .1.3.6.1.4.1.21317.1.3.1.2.??? = STRING: "6800.000"   <------ string  values need to be truncated to zero decimal places
+         #
+         s/\"//g;                                                       #get rid of quotation marks
+         if ( (/$ipmi{fan1speed_oid} = INTEGER: ([0-9]+)/) || (/$ipmi{fan1speed_oid} = STRING: ([0-9\.]+)/) ) {  #find the line with the text label we are looking for
+            $ipmi{fan1speed} = $1;					#assign value to hash
+            $ipmi{fan1speed} = sprintf("%.0f",$ipmi{fan1speed});            #truncate to zero decimal places
+            $ipmi{fan1speed} = $ipmi{fan1speed} * 100 if ($ipmi{fan1speed} < 100);        #multiply by 100
+            print "   FAN1 RPM: $ipmi{fan1speed} RPM\n" if ($verbose eq "yes");
+         }
+      }                                                                 #end of while loop
+      close IN;								#close filehandle
+   }									#end of if block
+   # 
+   #
+   # Look for FAN2
+   #
+   $ipmi{fan2speed} = 0;					#initialize variable
+   if ($ipmi{fan2speed_oid}) {						#confirm OID was found in the earlier SNMPWALK section
+      $cmd = "$snmpwalk -On -v 1 -c $community $host $ipmi{fan2speed_oid}";        #use -On to output the results in integer
+      print "   running command to find value for fan2speed: $cmd \n" if ($verbose eq "yes");
+      open(IN,"$cmd |");                                                #get the index numbers of the LUNs
+      while (<IN>) {                                                    #read a line from the command output
+         #
+         # looking for output similar to:  .1.3.6.1.4.1.21317.1.3.1.2.??? = INTEGER: 68          <------ integer values need to be multiplied by 100
+         # or possibly in STRING format:   .1.3.6.1.4.1.21317.1.3.1.2.??? = STRING: "6800.000"   <------ string  values need to be truncated to zero decimal places
+         #
+         s/\"//g;                                                       #get rid of quotation marks
+         if ( (/$ipmi{fan2speed_oid} = INTEGER: ([0-9]+)/) || (/$ipmi{fan2peedoid} = STRING: ([0-9\.]+)/) ) {  #find the line with the text label we are looking for
+            $ipmi{fan2speed} = $1;					#assign value to hash
+            $ipmi{fan2speed} = sprintf("%.0f",$ipmi{fan2speed});            #truncate to zero decimal places
+            $ipmi{fan2speed} = $ipmi{fan2speed} * 100 if ($ipmi{fan2speed} < 100);        #multiply by 100
+            print "   FAN2 RPM: $ipmi{fan2speed} RPM\n" if ($verbose eq "yes");
+         }
+      }                                                                 #end of while loop
+      close IN;								#close filehandle
+   }									#end of if block
+   # 
+   #
+   # Look for FAN3
+   #
+   $ipmi{fan3speed} = 0;					#initialize variable
+   if ($ipmi{fan3speed_oid}) {						#confirm OID was found in the earlier SNMPWALK section
+      $cmd = "$snmpwalk -On -v 1 -c $community $host $ipmi{fan3speed_oid}";        #use -On to output the results in integer
+      print "   running command to find value for fan3speed: $cmd \n" if ($verbose eq "yes");
+      open(IN,"$cmd |");                                                #get the index numbers of the LUNs
+      while (<IN>) {                                                    #read a line from the command output
+         #
+         # looking for output similar to:  .1.3.6.1.4.1.21317.1.3.1.2.??? = INTEGER: 68          <------ integer values need to be multiplied by 100
+         # or possibly in STRING format:   .1.3.6.1.4.1.21317.1.3.1.2.??? = STRING: "6800.000"   <------ string  values need to be truncated to zero decimal places
+         #
+         s/\"//g;                                                       #get rid of quotation marks
+         if ( (/$ipmi{fan3speed_oid} = INTEGER: ([0-9]+)/) || (/$ipmi{fan3speed_oid} = STRING: ([0-9\.]+)/) ) {  #find the line with the text label we are looking for
+            $ipmi{fan3speed} = $1;					#assign value to hash
+            $ipmi{fan3speed} = sprintf("%.0f",$ipmi{fan3speed});        #truncate to zero decimal places
+            $ipmi{fan3speed} = $ipmi{fan3speed} * 100 if ($ipmi{fan3speed} < 100);        #multiply by 100
+            print "   FAN3 RPM: $ipmi{fan3speed} RPM\n" if ($verbose eq "yes");
+         }
+      }                                                                 #end of while loop
+      close IN;								#close filehandle
+   }									#end of if block
+   # 
+   #
+   # Look for FAN4
+   #
+   $ipmi{fan4speed} = 0;					#initialize variable
+   if ($ipmi{fan4speed_oid}) {						#confirm OID was found in the earlier SNMPWALK section
+      $cmd = "$snmpwalk -On -v 1 -c $community $host $ipmi{fan4speed_oid}";        #use -On to output the results in integer
+      print "   running command to find value for fan4speed: $cmd \n" if ($verbose eq "yes");
+      open(IN,"$cmd |");                                                #get the index numbers of the LUNs
+      while (<IN>) {                                                    #read a line from the command output
+         #
+         # looking for output similar to:  .1.3.6.1.4.1.21317.1.3.1.2.??? = INTEGER: 68          <------ integer values need to be multiplied by 100
+         # or possibly in STRING format:   .1.3.6.1.4.1.21317.1.3.1.2.??? = STRING: "6800.000"   <------ string  values need to be truncated to zero decimal places
+         #
+         s/\"//g;                                                       #get rid of quotation marks
+         if ( (/$ipmi{fan4speed_oid} = INTEGER: ([0-9]+)/) || (/$ipmi{fan4speed_oid} = STRING: ([0-9\.]+)/) ) {  #find the line with the text label we are looking for
+            $ipmi{fan4speed} = $1;					#assign value to hash
+            $ipmi{fan4speed} = sprintf("%.0f",$ipmi{fan4});            #truncate to zero decimal places
+            $ipmi{fan4speed} = $ipmi{fan4speed} * 100 if ($ipmi{fan4speed} < 100);        #multiply by 100
+            print "   FAN4 RPM: $ipmi{fan4speed} RPM\n" if ($verbose eq "yes");
+         }
+      }                                                                 #end of while loop
+      close IN;								#close filehandle
+   }									#end of if block
+   # 
+   #
+   # Look for FANA
+   #
+   $ipmi{fanaspeed} = 0;					#initialize variable
+   if ($ipmi{fanaspeed_oid}) {						#confirm OID was found in the earlier SNMPWALK section
+      $cmd = "$snmpwalk -On -v 1 -c $community $host $ipmi{fanaspeed_oid}";        #use -On to output the results in integer
+      print "   running command to find value for fanaspeed: $cmd \n" if ($verbose eq "yes");
+      open(IN,"$cmd |");                                                #get the index numbers of the LUNs
+      while (<IN>) {                                                    #read a line from the command output
+         #
+         # looking for output similar to:  .1.3.6.1.4.1.21317.1.3.1.2.??? = INTEGER: 68          <------ integer values need to be multiplied by 100
+         # or possibly in STRING format:   .1.3.6.1.4.1.21317.1.3.1.2.??? = STRING: "6800.000"   <------ string  values need to be truncated to zero decimal places
+         #
+         s/\"//g;                                                       #get rid of quotation marks
+         if ( (/$ipmi{fanaspeed_oid} = INTEGER: ([0-9]+)/) || (/$ipmi{fanaspeed_oid} = STRING: ([0-9\.]+)/) ) {  #find the line with the text label we are looking for
+            $ipmi{fanaspeed} = $1;					#assign value to hash
+            $ipmi{fanaspeed} = sprintf("%.0f",$ipmi{fanaspeed});            #truncate to zero decimal places
+            $ipmi{fanaspeed} = $ipmi{fanaspeed} * 100 if ($ipmi{fanaspeed} < 100);        #multiply by 100
+            print "   FANA RPM: $ipmi{fanaspeed} RPM\n" if ($verbose eq "yes");
+         }
+      }                                                                 #end of while loop
+      close IN;								#close filehandle
+   }									#end of if block
+   # 
+   #
+   # Look for FANB
+   #
+   $ipmi{fanbspeed} = 0;					#initialize variable
+   if ($ipmi{fanbspeed_oid}) {						#confirm OID was found in the earlier SNMPWALK section
+      $cmd = "$snmpwalk -On -v 1 -c $community $host $ipmi{fanbspeed_oid}";        #use -On to output the results in integer
+      print "   running command to find value for fanbspeed: $cmd \n" if ($verbose eq "yes");
+      open(IN,"$cmd |");                                                #get the index numbers of the LUNs
+      while (<IN>) {                                                    #read a line from the command output
+         #
+         # looking for output similar to:  .1.3.6.1.4.1.21317.1.3.1.2.??? = INTEGER: 68          <------ integer values need to be multiplied by 100
+         # or possibly in STRING format:   .1.3.6.1.4.1.21317.1.3.1.2.??? = STRING: "6800.000"   <------ string  values need to be truncated to zero decimal places
+         #
+         s/\"//g;                                                       #get rid of quotation marks
+         if ( (/$ipmi{fanbspeed_oid} = INTEGER: ([0-9]+)/) || (/$ipmi{fanbspeed_oid} = STRING: ([0-9\.]+)/) ) {  #find the line with the text label we are looking for
+            $ipmi{fanbspeed} = $1;					#assign value to hash
+            $ipmi{fanbspeed} = sprintf("%.0f",$ipmi{fanbspeed});            #truncate to zero decimal places
+            $ipmi{fanbspeed} = $ipmi{fanbspeed} * 100 if ($ipmi{fanbspeed} < 100);        #multiply by 100
+            print "   FANB RPM: $ipmi{fanbspeed} RPM\n" if ($verbose eq "yes");
+         }
+      }                                                                 #end of while loop
+      close IN;								#close filehandle
+   }									#end of if block
+}									#end of subroutine 
+
+
+
+
+sub print_output {
+   #
+   # print output in the format expected by nagios
+   #
+   print "running print_output subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   # The nagios performance data will be the same for all the outputs, so just put it in a variable that can be use by all the output options
+   #
+   # The format is:  label=value[UOM];[warn];[crit];[min];[max]
+   # On the "label=value" section is required.  The warn|crit|min|max entries are optional.
+   # You can have multiple items of perf data, just separate each section with a space
+   # UOM is Units Of Measurement.    Can be s=seconds B=bytes MB=megabytes %=percent c=counter
+   # You can use the standard nagios ranges and thresholds formats (examples below)
+   # Range definition   Generate an alert if x...
+   # ----------------   -------------------------
+   # 10                 < 0 or > 10, (outside the range of {0 .. 10})
+   # 10:                < 10, (outside {10 .. ∞})
+   # ~:10               > 10, (outside the range of {-∞ .. 10})
+   # 10:20              < 10 or > 20, (outside the range of {10 .. 20})
+   # @10:20             ≥ 10 and ≤ 20, (inside the range of {10 .. 20})
+   #
+   $perf_data = "system_temperature=$ipmi{systemtemp};$system_temp_crit;$system_temp_warn;; cpu_temperature=$ipmi{cputemp};$cpu_temp_crit;$cpu_temp_warn;;";
+   #
+   #
+   # Much of the text of the output will be the same.  Put the common stuff in a variable so we can simplify the outputs
+   $output_details = "System temperature:$ipmi{systemtemp}C  CPU temperature:$ipmi{cputemp}C  DIMM-A1 temperature:$ipmi{dimma1temp}C DIMM-B1 temperature:$ipmi{dimmb1temp}C PCH temperature:$ipmi{pchtemp}C";
+   #
+   # Different systems have different numbers of cooling fans.  Only include the cooling fan details if the fan is spinning at >0 RPM
+   $output_details = "$output_details Fan1:$ipmi{fan1speed}rpm" if ($ipmi{fan1speed} > 0);
+   $output_details = "$output_details Fan2:$ipmi{fan2speed}rpm" if ($ipmi{fan2speed} > 0);
+   $output_details = "$output_details Fan3:$ipmi{fan3speed}rpm" if ($ipmi{fan3speed} > 0);
+   $output_details = "$output_details Fan4:$ipmi{fan4speed}rpm" if ($ipmi{fan4speed} > 0);
+   $output_details = "$output_details FanA:$ipmi{fanaspeed}rpm" if ($ipmi{fanaspeed} > 0);
+   $output_details = "$output_details FanB:$ipmi{fanbspeed}rpm" if ($ipmi{fanbspeed} > 0);
+   #
+   if ( $ipmi{systemtemp} eq "unknown" ) {
+      print "$CHECK_NAME UNKNOWN - could not determine system temperature.  $output_details | $perf_data \n";
+      exit $WARN;
+   }
+   if ( $ipmi{cputemp} eq "unknown" ) {
+      print "$CHECK_NAME UNKNOWN - could not determine system temperature.  $output_details | $perf_data \n";
+      exit $WARN;
+   }
+   if ( $ipmi{fan1speed} eq "unknown" ) {
+      print "$CHECK_NAME UNKNOWN - could not determine speed of fan1.  $output_details | $perf_data \n";
+      exit $WARN;
+   }
+   if ( $ipmi{cputemp} > $cpu_temp_warn ) {
+      print "$CHECK_NAME WARN - CPU temperature is $ipmi{cputemp}C.  The air conditioning or fans may have failed.   $output_details | $perf_data \n";
+      exit $WARN;
+   }
+   if ( $ipmi{systemtemp} > $system_temp_warn ) {
+      print "$CHECK_NAME WARN - system temperature is $ipmi{systemtemp}C.  The air conditioning or fans may have failed.   $output_details | $perf_data \n";
+      exit $WARN;
+   }
+   #
+   # This message gets sent if everything is ok
+   print "$CHECK_NAME OK - $output_details | $perf_data \n";
+   exit $OK;
+}                                                                       #end of subroutine
+
+
+
+# --------------------------- main body of program ----------------------
+get_options;
+sanity_checks;
+get_system_temperature; 
+get_fan_speeds;
+print_output;
+
+
+
+
