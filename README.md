@@ -3,7 +3,8 @@
 
 
 ## Requirements
-perl, snmpwalk, snmpget
+perl, snmpwalk, snmpget on nagios server
+IP address configured on IPMI service processor with SNMP enabled
 
 
 ## Configuration
